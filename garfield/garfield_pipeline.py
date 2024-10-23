@@ -3,8 +3,12 @@ from dataclasses import dataclass, field
 from typing import Literal, Type, Mapping, Any
 
 import torch
+from pathlib import Path
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
 from torch.cuda.amp.grad_scaler import GradScaler
+from nerfstudio.viewer.viewer_elements import *
+from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
+from nerfstudio.cameras.rays import RayBundle
 
 import tqdm
 
@@ -52,6 +56,17 @@ class GarfieldPipeline(VanillaPipeline):
             local_rank,
             grad_scaler,
         )
+
+        self.z_export_options = ViewerCheckbox(name="Export Options", default_value=False, cb_hook=self._update_export_options)
+        self.z_export_similar_affinities = ViewerButton(
+            name="Export Similar Affinity Pointcloud",
+            visible=False,
+            cb_hook=self._export_similar_affinities
+        )
+
+    def _update_export_options(self, checkbox: ViewerCheckbox):
+        """Update the UI based on the export options"""
+        self.z_export_similar_affinities.set_hidden(not checkbox.value)
 
     def get_train_loss_dict(self, step: int):
         """In addition to the base class, we also calculate SAM masks
@@ -184,3 +199,162 @@ class GarfieldPipeline(VanillaPipeline):
             ).to(scales.device)
 
         return quantile_transformer_func
+
+
+    def _export_similar_affinities(self, button: ViewerButton):
+        """Export the similar affinities to a .ply file"""
+
+        # location to save
+        output_dir = f"outputs/{self.datamanager.config.dataparser.data.name}"
+        filename = Path(output_dir) / f"pointcloud.ply"
+        model = self.model
+
+        # Whether the normals should be estimated based on the point cloud.
+        
+        num_points = 1000000
+        remove_outliers = True
+        estimate_normals = False
+        reorient_normals = False
+        rgb_output_name= "rgb"
+        depth_output_name = "depth"
+        normal_output_name = None
+        crop_obb = None
+        std_ratio = 10.0
+        save_world_frame = False
+
+        from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
+        progress = Progress(
+            TextColumn(":cloud: Computing Point Cloud :cloud:"),
+            BarColumn(),
+            TaskProgressColumn(show_speed=True),
+            TimeRemainingColumn(elapsed_when_finished=True, compact=True),
+            console=CONSOLE,
+        )
+        points = []
+        rgbs = []
+        normals = []
+        view_directions = []
+
+        with progress as progress_bar:
+            task = progress_bar.add_task("Generating Point Cloud", total=num_points)
+            while not progress_bar.finished:
+                normal = None
+            
+                with torch.no_grad():
+                    ray_bundle, _ = self.datamanager.next_train(0)
+                    assert isinstance(ray_bundle, RayBundle)
+                    outputs = self.model(ray_bundle)
+                if rgb_output_name not in outputs:
+                    CONSOLE.rule("Error", style="red")
+                    CONSOLE.print(f"Could not find {rgb_output_name} in the model outputs", justify="center")
+                    CONSOLE.print(f"Please set --rgb_output_name to one of: {outputs.keys()}", justify="center")
+                    sys.exit(1)
+                if depth_output_name not in outputs:
+                    CONSOLE.rule("Error", style="red")
+                    CONSOLE.print(f"Could not find {depth_output_name} in the model outputs", justify="center")
+                    CONSOLE.print(f"Please set --depth_output_name to one of: {outputs.keys()}", justify="center")
+                    sys.exit(1)
+                rgba = self.model.get_rgba_image(outputs, rgb_output_name)
+                depth = outputs[depth_output_name]
+                if normal_output_name is not None:
+                    if normal_output_name not in outputs:
+                        CONSOLE.rule("Error", style="red")
+                        CONSOLE.print(f"Could not find {normal_output_name} in the model outputs", justify="center")
+                        CONSOLE.print(f"Please set --normal_output_name to one of: {outputs.keys()}", justify="center")
+                        sys.exit(1)
+                    normal = outputs[normal_output_name]
+                    assert (
+                        torch.min(normal) >= 0.0 and torch.max(normal) <= 1.0
+                    ), "Normal values from method output must be in [0, 1]"
+                    normal = (normal * 2.0) - 1.0
+                point = ray_bundle.origins + ray_bundle.directions * depth
+                view_direction = ray_bundle.directions
+
+                # Filter points with opacity lower than 0.5
+                mask = rgba[..., -1] > 0.5
+                point = point[mask]
+                view_direction = view_direction[mask]
+                rgb = rgba[mask][..., :3]
+                if normal is not None:
+                    normal = normal[mask]
+
+                if crop_obb is not None:
+                    mask = crop_obb.within(point)
+                    point = point[mask]
+                    rgb = rgb[mask]
+                    view_direction = view_direction[mask]
+                    if normal is not None:
+                        normal = normal[mask]
+
+                points.append(point)
+                rgbs.append(rgb)
+                view_directions.append(view_direction)
+                if normal is not None:
+                    normals.append(normal)
+                progress.advance(task, point.shape[0])
+        points = torch.cat(points, dim=0)
+        rgbs = torch.cat(rgbs, dim=0)
+        view_directions = torch.cat(view_directions, dim=0).cpu()
+
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.double().cpu().numpy())
+        pcd.colors = o3d.utility.Vector3dVector(rgbs.double().cpu().numpy())
+
+        ind = None
+        if remove_outliers:
+            CONSOLE.print("Cleaning Point Cloud")
+            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=std_ratio)
+            print("\033[A\033[A")
+            CONSOLE.print("[bold green]:white_check_mark: Cleaning Point Cloud")
+            if ind is not None:
+                view_directions = view_directions[ind]
+
+        # either estimate_normals or normal_output_name, not both
+        if estimate_normals:
+            if normal_output_name is not None:
+                CONSOLE.rule("Error", style="red")
+                CONSOLE.print("Cannot estimate normals and use normal_output_name at the same time", justify="center")
+                sys.exit(1)
+            CONSOLE.print("Estimating Point Cloud Normals")
+            pcd.estimate_normals()
+            print("\033[A\033[A")
+            CONSOLE.print("[bold green]:white_check_mark: Estimating Point Cloud Normals")
+        elif normal_output_name is not None:
+            normals = torch.cat(normals, dim=0)
+            if ind is not None:
+                # mask out normals for points that were removed with remove_outliers
+                normals = normals[ind]
+            pcd.normals = o3d.utility.Vector3dVector(normals.double().cpu().numpy())
+
+        # re-orient the normals
+        if reorient_normals:
+            normals = torch.from_numpy(np.array(pcd.normals)).float()
+            mask = torch.sum(view_directions * normals, dim=-1) > 0
+            normals[mask] *= -1
+            pcd.normals = o3d.utility.Vector3dVector(normals.double().cpu().numpy())
+
+        
+        if save_world_frame:
+            # apply the inverse dataparser transform to the point cloud
+            points = np.asarray(pcd.points)
+            poses = np.eye(4, dtype=np.float32)[None, ...].repeat(points.shape[0], axis=0)[:, :3, :]
+            poses[:, :3, 3] = points
+            poses = pipeline.datamanager.train_dataparser_outputs.transform_poses_to_original_space(
+                torch.from_numpy(poses)
+            )
+            points = poses[:, :3, 3].numpy()
+            pcd.points = o3d.utility.Vector3dVector(points)
+
+        torch.cuda.empty_cache()
+
+        CONSOLE.print(f"[bold green]:white_check_mark: Generated {pcd}")
+        CONSOLE.print("Saving Point Cloud...")
+        tpcd = o3d.t.geometry.PointCloud.from_legacy(pcd)
+        # The legacy PLY writer converts colors to UInt8,
+        # let us do the same to save space.
+        tpcd.point.colors = (tpcd.point.colors * 255).to(o3d.core.Dtype.UInt8)  # type: ignore
+        o3d.t.io.write_point_cloud(str(filename), tpcd)
+        print("\033[A\033[A")
+        CONSOLE.print("[bold green]:white_check_mark: Saving Point Cloud to " + str(filename))
+
