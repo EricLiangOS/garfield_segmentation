@@ -9,6 +9,9 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from nerfstudio.viewer.viewer_elements import *
 from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
 from nerfstudio.cameras.rays import RayBundle
+from nerfstudio.exporter.exporter_utils import *
+from nerfstudio.exporter.texture_utils import export_textured_mesh
+
 
 import tqdm
 
@@ -213,7 +216,7 @@ class GarfieldPipeline(VanillaPipeline):
         
         num_points = 1000000
         remove_outliers = True
-        estimate_normals = False
+        estimate_normals = True
         reorient_normals = False
         rgb_output_name= "rgb"
         depth_output_name = "depth"
@@ -269,12 +272,19 @@ class GarfieldPipeline(VanillaPipeline):
                     normal = (normal * 2.0) - 1.0
                 point = ray_bundle.origins + ray_bundle.directions * depth
                 view_direction = ray_bundle.directions
+                model_output = self.model.get_outputs(ray_bundle)["instance_interact"]
 
                 # Filter points with opacity lower than 0.5
                 mask = rgba[..., -1] > 0.5
                 point = point[mask]
                 view_direction = view_direction[mask]
                 rgb = rgba[mask][..., :3]
+
+                mask = model_output == 0
+                point = point[mask]
+                view_direction = view_direction[mask]
+                rgb = rgba[mask][..., :3]
+
                 if normal is not None:
                     normal = normal[mask]
 
@@ -358,3 +368,32 @@ class GarfieldPipeline(VanillaPipeline):
         print("\033[A\033[A")
         CONSOLE.print("[bold green]:white_check_mark: Saving Point Cloud to " + str(filename))
 
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+        vertices_to_remove = densities < np.quantile(densities, 0.1)
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+        print("\033[A\033[A")
+        CONSOLE.print("[bold green]:white_check_mark: Computing Mesh")
+
+        CONSOLE.print("Saving Mesh...")
+        o3d.io.write_triangle_mesh(str(Path(output_dir) / f"poisson_mesh.ply"), mesh)
+        print("\033[A\033[A")
+        CONSOLE.print("[bold green]:white_check_mark: Saving Mesh")
+
+        texture_method = "nerf"
+        target_num_faces = 50000
+        # This will texture the mesh with NeRF and export to a mesh.obj file
+        # and a material and texture file
+        if texture_method == "nerf":
+            # load the mesh from the poisson reconstruction
+            mesh = get_mesh_from_filename(
+                str(Path(output_dir) / "poisson_mesh.ply"), target_num_faces=target_num_faces
+            )
+            CONSOLE.print("Texturing mesh with NeRF")
+            export_textured_mesh(
+                mesh,
+                self,
+                Path(output_dir),
+                px_per_uv_triangle=None,
+                unwrap_method="xatlas",
+                num_pixels_per_side=2048,
+            )

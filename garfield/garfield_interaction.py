@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple, Union
 import viser
 import trimesh
 import torch.nn as nn
+import torch
 
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.field_components.field_heads import FieldHeadNames
@@ -141,6 +142,13 @@ class GarfieldClickScene(nn.Module):
         x = x / x.norm(dim=-1, keepdim=True)
         instance_pass = grouping_field.get_mlp(x, torch.tensor([instance_scale]).to(self.device).view(1, 1))
 
+        point_affinity = instance_pass[0]
+        affinity_difference = outputs['instance'] - instance_pass.float()
+        norm_affinity_difference = torch.norm(affinity_difference, p=2, dim=-1)
+
+        norm_affinity_difference[norm_affinity_difference < 0.35] = 0
+        
+
         return {
-            "instance_interact": torch.norm(outputs['instance'] - instance_pass.float(), p=2, dim=-1)
+            "instance_interact": norm_affinity_difference
         }
