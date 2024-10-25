@@ -16,6 +16,8 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from nerfstudio.viewer.viewer_elements import *
 from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
 from nerfstudio.models.splatfacto import SplatfactoModel
+from nerfstudio.exporter.exporter_utils import *
+from nerfstudio.exporter.texture_utils import export_textured_mesh
 
 from cuml.cluster.hdbscan import HDBSCAN
 from nerfstudio.models.splatfacto import RGB2SH
@@ -117,12 +119,18 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.cluster_labels = None
 
         self.reset_state = ViewerButton(name="Reset State", cb_hook=self._reset_state, disabled=True)
+        self.output_location = ViewerText(name="Output Directory", default_value = f"outputs/{self.datamanager.config.dataparser.data.name}")
 
         self.z_export_options = ViewerCheckbox(name="Export Options", default_value=False, cb_hook=self._update_export_options)
         self.z_export_options_visible_gaussians = ViewerButton(
             name="Export Visible Gaussians",
             visible=False,
             cb_hook=self._export_visible_gaussians
+            )
+        self.z_export_options_gaussian_mesh = ViewerButton(
+            name="Export Gaussian Mesh",
+            visible=False,
+            cb_hook=self._export_gaussian_mesh
             )
         self.z_export_options_camera_path_filename = ViewerText("Camera Path Filename", "", visible=False)
         self.z_export_options_camera_path_render = ViewerButton("Render Current Pipeline", cb_hook=self.render_from_path, visible=False)
@@ -145,6 +153,7 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.z_export_options_camera_path_filename.set_hidden(not checkbox.value)
         self.z_export_options_camera_path_render.set_hidden(not checkbox.value)
         self.z_export_options_visible_gaussians.set_hidden(not checkbox.value)
+        self.z_export_options_gaussian_mesh.set_hidden(not checkbox.value)
 
     def _reset_state(self, button: ViewerButton):
         """Revert to previous saved state"""
@@ -543,7 +552,7 @@ class GarfieldGaussianPipeline(VanillaPipeline):
     def _export_visible_gaussians(self, button: ViewerButton):
         """Export the visible gaussians to a .ply file"""
         # location to save
-        output_dir = f"outputs/{self.datamanager.config.dataparser.data.name}"
+        output_dir = self.output_location.value
         filename = Path(output_dir) / f"gaussians.ply"
 
         # Copied from exporter.py
@@ -603,6 +612,45 @@ class GarfieldGaussianPipeline(VanillaPipeline):
             count = np.sum(select)
         from nerfstudio.scripts.exporter import ExportGaussianSplat
         ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors)
+
+    def _export_gaussian_mesh(self, button: ViewerButton):
+        output_dir = self.output_location.value
+        filename = Path(output_dir) / f"gaussian_mesh.ply"
+        model = self.model
+
+        self._export_visible_gaussians(button)
+        ply_point_cloud = o3d.data.PLYPointCloud(str(filename))
+        pcd = o3d.io.read_point_cloud(str(filename))
+
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+        vertices_to_remove = densities < np.quantile(densities, 0.1)
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+        print("\033[A\033[A")
+        CONSOLE.print("[bold green]:white_check_mark: Computing Mesh")
+
+        CONSOLE.print("Saving Mesh...")
+        o3d.io.write_triangle_mesh(str(Path(output_dir) / f"poisson_mesh.ply"), mesh)
+        print("\033[A\033[A")
+        CONSOLE.print("[bold green]:white_check_mark: Saving Mesh")
+
+        texture_method = "nerf"
+        target_num_faces = 50000
+        # This will texture the mesh with NeRF and export to a mesh.obj file
+        # and a material and texture file
+        if texture_method == "nerf":
+            # load the mesh from the poisson reconstruction
+            mesh = get_mesh_from_filename(
+                str(Path(output_dir) / "poisson_mesh.ply"), target_num_faces=target_num_faces
+            )
+            CONSOLE.print("Texturing mesh with NeRF")
+            export_textured_mesh(
+                mesh,
+                self.garfield_pipeline[0],
+                Path(output_dir),
+                px_per_uv_triangle=None,
+                unwrap_method="xatlas",
+                num_pixels_per_side=2048,
+            )
 
 
     def render_from_path(self, button: ViewerButton):

@@ -12,7 +12,7 @@ from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.exporter.exporter_utils import *
 from nerfstudio.exporter.texture_utils import export_textured_mesh
 
-
+import open3d as o3d
 import tqdm
 
 from sklearn.preprocessing import QuantileTransformer
@@ -60,16 +60,19 @@ class GarfieldPipeline(VanillaPipeline):
             grad_scaler,
         )
 
-        self.z_export_options = ViewerCheckbox(name="Export Options", default_value=False, cb_hook=self._update_export_options)
+        self.num_points = ViewerText(name="Number of Points", default_value = "100000")
+        self.output_location = ViewerText(name="Output Directory", default_value = f"outputs/{self.datamanager.config.dataparser.data.name}")
+
         self.z_export_similar_affinities = ViewerButton(
             name="Export Similar Affinity Pointcloud",
-            visible=False,
+            visible=True,
             cb_hook=self._export_similar_affinities
         )
-
-    def _update_export_options(self, checkbox: ViewerCheckbox):
-        """Update the UI based on the export options"""
-        self.z_export_similar_affinities.set_hidden(not checkbox.value)
+        self.z_export_mesh = ViewerButton(
+            name="Export Scene Mesh",
+            visible=True,
+            cb_hook=self._export_mesh
+        )
 
     def get_train_loss_dict(self, step: int):
         """In addition to the base class, we also calculate SAM masks
@@ -208,13 +211,13 @@ class GarfieldPipeline(VanillaPipeline):
         """Export the similar affinities to a .ply file"""
 
         # location to save
-        output_dir = f"outputs/{self.datamanager.config.dataparser.data.name}"
+        output_dir = self.output_location.value
         filename = Path(output_dir) / f"pointcloud.ply"
         model = self.model
 
         # Whether the normals should be estimated based on the point cloud.
         
-        num_points = 1000000
+        num_points = int(self.num_points.value)
         remove_outliers = True
         estimate_normals = True
         reorient_normals = False
@@ -233,6 +236,10 @@ class GarfieldPipeline(VanillaPipeline):
             TimeRemainingColumn(elapsed_when_finished=True, compact=True),
             console=CONSOLE,
         )
+
+        groups = {} # key is affinity value, value is object_info
+        object_info = ([], [], [], []) # points, rgbs, normals, view_directions
+
         points = []
         rgbs = []
         normals = []
@@ -280,6 +287,21 @@ class GarfieldPipeline(VanillaPipeline):
                 view_direction = view_direction[mask]
                 rgb = rgba[mask][..., :3]
 
+                # for affinity in model_output:
+                #     mask = model_output == affinity
+                #     new_points = point[mask]
+                #     new_view_direction = view_direction[mask]
+                #     new_rgb = rgba[mask][..., :3]
+
+                    # if affinity in groups:
+                    #     groups[affinity][0].append(new_points)
+                    #     groups[affinity][1].append(new_rgb)
+                        
+                    #     if 
+
+                    #     groups[affinity][3].append(new_view_direction)
+
+
                 mask = model_output == 0
                 point = point[mask]
                 view_direction = view_direction[mask]
@@ -306,7 +328,6 @@ class GarfieldPipeline(VanillaPipeline):
         rgbs = torch.cat(rgbs, dim=0)
         view_directions = torch.cat(view_directions, dim=0).cpu()
 
-        import open3d as o3d
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points.double().cpu().numpy())
         pcd.colors = o3d.utility.Vector3dVector(rgbs.double().cpu().numpy())
@@ -344,7 +365,6 @@ class GarfieldPipeline(VanillaPipeline):
             normals[mask] *= -1
             pcd.normals = o3d.utility.Vector3dVector(normals.double().cpu().numpy())
 
-        
         if save_world_frame:
             # apply the inverse dataparser transform to the point cloud
             points = np.asarray(pcd.points)
@@ -367,6 +387,16 @@ class GarfieldPipeline(VanillaPipeline):
         o3d.t.io.write_point_cloud(str(filename), tpcd)
         print("\033[A\033[A")
         CONSOLE.print("[bold green]:white_check_mark: Saving Point Cloud to " + str(filename))
+
+        return pcd
+
+    def _export_mesh(self, button: ViewerButton):
+
+        output_dir = self.output_location.value
+        filename = Path(output_dir) / f"pointcloud.ply"
+        model = self.model
+
+        pcd = self._export_similar_affinities(button)
 
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
         vertices_to_remove = densities < np.quantile(densities, 0.1)

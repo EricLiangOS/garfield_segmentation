@@ -146,7 +146,7 @@ class GarfieldClickScene(nn.Module):
         affinity_difference = outputs['instance'] - instance_pass.float()
         norm_affinity_difference = torch.norm(affinity_difference, p=2, dim=-1)
 
-        norm_affinity_difference[norm_affinity_difference < 0.35] = 0
+        norm_affinity_difference[norm_affinity_difference < 0.15] = 0
         
 
         return {
