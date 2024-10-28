@@ -1,6 +1,6 @@
 import typing
 from dataclasses import dataclass, field
-from typing import Literal, Type, Mapping, Any
+from typing import Literal, Type, Mapping, Any, Optional
 
 import torch
 from pathlib import Path
@@ -11,7 +11,8 @@ from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.exporter.exporter_utils import *
 from nerfstudio.exporter.texture_utils import export_textured_mesh
-
+from nerfstudio.data.scene_box import OrientedBox
+import os
 import open3d as o3d
 import tqdm
 
@@ -30,7 +31,7 @@ class GarfieldPipelineConfig(VanillaPipelineConfig):
     datamanager: GarfieldDataManagerConfig = field(default_factory=lambda: GarfieldDataManagerConfig())
     model: GarfieldModelConfig = field(default_factory=lambda: GarfieldModelConfig())
 
-    start_grouping_step: int = 2000
+    start_grouping_step: int = 10
     max_grouping_scale: float = 2.0
     num_rays_per_image: int = 256
     normalize_grouping_scale: bool = True
@@ -121,6 +122,27 @@ class GarfieldPipeline(VanillaPipeline):
         # Calculate multi-scale masks, and their 3D scales
         scales_3d_list, pixel_level_keys_list, group_cdf_list = [], [], []
         train_cameras = self.datamanager.train_dataset.cameras
+
+
+
+        import glob
+        import os.path as osp
+        img_dir = f"outputs/{self.datamanager.config.dataparser.data.name}/images"
+
+
+        if not osp.exists(img_dir):
+            os.makedirs(img_dir)
+        files = glob.glob(f"{img_dir}/*")
+        for f in files:
+            os.remove(f)
+
+        for i in range(len(self.datamanager.train_dataset.cameras)):
+            img = self.datamanager.train_dataset[i]["image"]
+            img = img.permute(2, 0, 1)
+            from torchvision.utils import save_image
+            
+            save_image(img, f"{img_dir}/{i}.jpg")
+
         for i in tqdm.trange(len(train_cameras), desc="Calculating 3D masks"):
             camera_ray_bundle = train_cameras.generate_rays(camera_indices=i).to(
                 self.device
@@ -140,7 +162,7 @@ class GarfieldPipeline(VanillaPipeline):
                 scale_3d,
                 group_cdf,
             ) = self.datamanager._calculate_3d_groups(
-                rgb, depth, points, max_scale=self.config.max_grouping_scale
+                i, img_dir, rgb, depth, points, max_scale=self.config.max_grouping_scale
             )
 
             pixel_level_keys_list.append(pixel_level_keys)
@@ -224,8 +246,17 @@ class GarfieldPipeline(VanillaPipeline):
         rgb_output_name= "rgb"
         depth_output_name = "depth"
         normal_output_name = None
+
         crop_obb = None
-        std_ratio = 10.0
+        
+        obb_center = tuple(self.model.click_scene.selected_location[0])
+        obb_scale = (0.40, 0.40, 0.40)
+        obb_rotation = (0.02, 0.03, 0.01)
+
+        if obb_center is not None and obb_rotation is not None and obb_scale is not None:
+            crop_obb = OrientedBox.from_params(obb_center, obb_rotation, obb_scale)
+
+        std_ratio = 0.5
         save_world_frame = False
 
         from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
@@ -427,3 +458,5 @@ class GarfieldPipeline(VanillaPipeline):
                 unwrap_method="xatlas",
                 num_pixels_per_side=2048,
             )
+    
+    

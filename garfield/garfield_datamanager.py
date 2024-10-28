@@ -13,6 +13,7 @@ import torch
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from rich.progress import Console
+from collections import OrderedDict
 
 CONSOLE = Console(width=120)
 
@@ -27,7 +28,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManagerConfig,
 )
 
-from garfield.img_group_model import ImgGroupModelConfig, ImgGroupModel
+from garfield.img_group_model import ImgGroupModelConfig, SamGroupModelConfig, ImgGroupModel, SamGroupModel
 from garfield.garfield_pixel_sampler import GarfieldPixelSampler
 
 
@@ -35,7 +36,7 @@ from garfield.garfield_pixel_sampler import GarfieldPixelSampler
 class GarfieldDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: GarfieldDataManager)
     """The datamanager class to use."""
-    img_group_model: ImgGroupModelConfig = field(default_factory=lambda: ImgGroupModelConfig())
+    img_group_model: SamGroupModelConfig = field(default_factory=lambda: SamGroupModelConfig())
     """The SAM model to use. This can be any other model that outputs masks..."""
 
 
@@ -67,7 +68,8 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
             local_rank=local_rank,
             **kwargs,
         )
-        self.img_group_model: ImgGroupModel = self.config.img_group_model.setup(device=self.device)
+        # self.img_group_model: ImgGroupModel = self.config.img_group_model.setup(device=self.device)
+        self.img_group_model: SamGroupModel = self.config.img_group_model.setup(device=self.device)
 
         # This is where all the group data + statistics is stored.
         # Note that this can get quite big (~10GB if 300 images, ...)
@@ -78,6 +80,8 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
         self.scale_3d = None
         self.group_cdf = None
         self.scale_3d_statistics = None
+        self.inference_state = None
+        self.video_segments = None
 
     def load_sam_data(self) -> bool:
         """
@@ -157,8 +161,58 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
 
         return pixel_mask_array
 
+    def get_inference_state(self):
+        train_dataset = self.train_dataset
+        video_height, video_width = train_dataset[0]["image"].shape[:2]
+        inference_state = {}
+
+        # images, video_height, video_width = load_video_frames(
+        #     video_path=video_path,
+        #     image_size=self.image_size,
+        #     offload_video_to_cpu=offload_video_to_cpu,
+        #     async_loading_frames=async_loading_frames,
+        #     compute_device=compute_device,
+        # )
+        num_frames = len(train_dataset)
+        images = torch.zeros(num_frames, 3, 512, 512, dtype=torch.float32)
+
+        for i in range(len(train_dataset.cameras)):
+            img = train_dataset[i]["image"].resize_(512, 512, 3)
+            img = img / 255.0
+            
+
+            images[i] = img.permute(2, 0, 1)
+        
+        inference_state["images"] = images
+        inference_state["num_frames"] = len(images)
+        inference_state["offload_video_to_cpu"] = offload_video_to_cpu = False
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu = False
+        inference_state["video_height"] = video_height
+        inference_state["video_width"] = video_width
+        inference_state["point_inputs_per_obj"] = {}
+        inference_state["mask_inputs_per_obj"] = {}
+        inference_state["cached_features"] = {}
+        inference_state["constants"] = {}
+        inference_state["obj_id_to_idx"] = OrderedDict()
+        inference_state["obj_idx_to_id"] = OrderedDict()
+        inference_state["obj_ids"] = []
+        inference_state["output_dict_per_obj"] = {}
+        inference_state["temp_output_dict_per_obj"] = {}
+        
+        inference_state["consolidated_frame_inds"] = {
+            "cond_frame_outputs": set(),  # set containing frame indices
+            "non_cond_frame_outputs": set(),  # set containing frame indices
+        }
+        inference_state["tracking_has_started"] = False
+        inference_state["frames_already_tracked"] = {}
+
+        return inference_state
+
+
     def _calculate_3d_groups(
         self,
+        index : int,
+        path : str,
         rgb: torch.Tensor,
         depth: torch.Tensor,
         point: torch.Tensor,
@@ -191,8 +245,36 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
             )
             return (pixel_level_keys, scale, mask_cdf)
 
+        import matplotlib.pyplot as plt
+        def show_mask(mask, ax, obj_id=None, random_color=False):
+            if random_color:
+                color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+            else:
+                cmap = plt.get_cmap("tab10")
+                cmap_idx = 0 if obj_id is None else obj_id
+                color = np.array([*cmap(cmap_idx)[:3], 0.6])
+            h, w = mask.shape[-2:]
+            mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+            ax.imshow(mask_image)
+        
+        if self.inference_state is None:
+            self.inference_state = self.get_inference_state()
+            self.inference_state["device"] = self.device
+
         # Calculate SAM masks
-        masks = self.img_group_model((rgb.numpy() * 255).astype(np.uint8))
+        # masks = self.img_group_model.functioning_call("/home/ehliang/images/", index)
+
+        if self.video_segments is None:
+            self.video_segments = self.img_group_model(path)
+        masks = self.video_segments[index]
+
+
+        plt.close("all")
+        for out_obj_id, out_mask in masks.items():
+            if (index%100 == 0):
+                show_mask(out_mask, plt.gca(), obj_id=out_obj_id)
+                plt.savefig(f"{path}/mask_{index}.jpg")
+
 
         # If no masks are found, return dummy data.
         if len(masks) == 0:
@@ -205,7 +287,7 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
         # 1) Denoise the masks (through eroding)
         all_masks = torch.stack(
             # [torch.from_numpy(_["segmentation"]).to(self.device) for _ in masks]
-            [torch.from_numpy(_).to(self.device) for _ in masks]
+            [torch.from_numpy(masks[_].squeeze(0)).to(self.device) for _ in masks]
         )
         # erode all masks using 3x3 kernel
         eroded_masks = torch.conv2d(
@@ -213,7 +295,7 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
             torch.full((3, 3), 1.0).view(1, 1, 3, 3).to("cuda"),
             padding=1,
         )
-        eroded_masks = (eroded_masks >= 5).squeeze(1)  # (num_masks, H, W)
+        eroded_masks = (eroded_masks >= 5).squeeze(0)  # (num_masks, H, W)
 
         # 2) Calculate 3D scale
         # Don't include groups with scale > max_scale (likely to be too noisy to be useful)
